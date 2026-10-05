@@ -6,10 +6,10 @@ A custom Linux kernel for Xiaomi **miatoll** devices, built for
 | | |
 |---|---|
 | **Name** | Shadow Kernel |
-| **Owner / Maintainer** | Vortex FR |
+| **Owner / Maintainer** | @vortex_frr |
 | **Platform** | Xiaomi SM6250 / SM7125 — `miatoll` |
 | **Supported devices** | POCO M2 Pro (`gram`), Redmi Note 9 Pro / Pro Max (`curtana`), Redmi Note 9S / Pro (Global) (`excalibur`), Redmi Note 9 Pro (China) (`joyeuse`) |
-| **Tested ROM target** | EvolutionX (Android 16) |
+| **ROM / Android** | Built for **EvolutionX on Android 16**; works as a general Android 16 kernel for miatoll (compatible with any Android 16‑based ROM) |
 | **Kernel base** | Linux 4.14.x (CAF / OpenELA) |
 | **Root** | **KernelSU** built-in (no separate root needed) |
 
@@ -32,15 +32,18 @@ A custom Linux kernel for Xiaomi **miatoll** devices, built for
   module (gaming, daily, battery presets).
 - Built with **Clang** + LLD for a modern, optimised image.
 
-## KernelSU Manager compatibility
+## Root — KernelSU Manager
 
-Because KernelSU is built **in-tree** (v0.9.5), install the matching
-**KernelSU Manager v0.9.5** (or the official `me.weishu.kernelsu` manager from
-the KernelSU releases page). Newer managers expect a different kernel ABI and may
-refuse to pair with v0.9.5.
+Root is provided by **KernelSU**, built **into** the kernel (`CONFIG_KSU=y`), so no
+separate root solution is needed. After flashing Shadow Kernel, install the
+**KernelSU Manager** app (the official `me.weishu.kernelsu` manager, v0.9.5 to
+match this in‑tree build) — it talks to the kernel and grants root.
 
-After flashing Shadow Kernel, open KernelSU Manager → it should report the kernel
-as rooted. Install root apps / modules from there.
+> Newer KernelSU managers expect a different kernel ABI and may refuse to pair
+> with the v0.9.5 in‑tree build, so use the matching **KernelSU Manager v0.9.5**.
+
+Open KernelSU Manager → it should report the kernel as rooted. Install root apps
+and modules from there.
 
 ## Building
 

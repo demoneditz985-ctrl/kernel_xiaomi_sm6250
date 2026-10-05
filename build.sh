@@ -17,7 +17,7 @@ function compile()
 
     export ARCH=arm64
     export KBUILD_BUILD_HOST="Shadow-Kernel"
-    export KBUILD_BUILD_USER="VortexFR"
+    export KBUILD_BUILD_USER="vortex_frr"
 
     # --- Toolchains (auto-clone if missing) ---
     clangbin=clang/bin/clang
