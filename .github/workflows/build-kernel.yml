@@ -1,0 +1,324 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow-schema.json
+#
+# Shadow Kernel CI - builds the miatoll (SM6150/SM6250 family) Image.gz and
+# packs it into a flashable AnyKernel3 zip.
+#
+# The build recipe is NOT duplicated here: this workflow installs the host
+# dependencies and then runs ./build.sh, so CI and your local CLI build can
+# never drift apart.
+#
+# Triggers
+#   * push to any branch                 -> build + artifacts, no release
+#   * push a tag (v*, *-release, Shadow-*) -> build + GitHub Release on that tag
+#   * pull request                       -> build only (proves it still compiles)
+#   * "Run workflow" button              -> all of the above, with options
+#
+# Get a build: open the run -> Artifacts, or the Release if one was published.
+
+name: Build Shadow Kernel (miatoll)
+
+run-name: "Shadow Kernel · ${{ github.ref_name }} · ${{ github.event_name }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig path, relative to arch/arm64/configs/"
+        type: string
+        required: false
+        default: vendor/xiaomi/miatoll_defconfig
+      build_target:
+        description: "make target (empty = defconfig default: Image.gz + dtbs + dtbo.img)"
+        type: string
+        required: false
+        default: ""
+      release_mode:
+        description: "Publish the flashable zip as a GitHub Release"
+        type: choice
+        required: false
+        default: auto
+        options:
+          - auto
+          - nightly
+          - off
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+      - "*-release"
+      - "Shadow-*"
+    paths-ignore:
+      - "**.md"
+      - "Documentation/**"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "Documentation/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ARCH: arm64
+  DEVICE_NAME: miatoll
+  DEFCONFIG: vendor/xiaomi/miatoll_defconfig
+  OUT_DIR: out
+  # Same prebuilts ./build.sh clones on a fresh machine
+  CLANG_REPO: https://github.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-6443078
+  GCC64_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9
+  GCC32_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9
+
+jobs:
+  build:
+    name: Compile + AnyKernel3 zip
+    # ubuntu-22.04 ships gcc-11, the most forgiving host compiler for a 4.14
+    # tree. Bump to ubuntu-24.04 if this label is ever retired.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Resolve build inputs
+        shell: bash
+        env:
+          IN_DEFCONFIG: ${{ inputs.defconfig }}
+          IN_TARGET: ${{ inputs.build_target }}
+          IN_RELEASE: ${{ inputs.release_mode }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${IN_DEFCONFIG:-}" ]]; then
+            echo "DEFCONFIG=$IN_DEFCONFIG" >> "$GITHUB_ENV"
+          fi
+          if [[ -n "${IN_TARGET:-}" ]]; then
+            echo "KERNEL_TARGET=$IN_TARGET" >> "$GITHUB_ENV"
+          fi
+          # one timestamp shared by the compile step, the zip name and artifacts
+          echo "TANGGAL=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
+
+          mode="${IN_RELEASE:-auto}"
+          if [[ "$mode" == "auto" ]]; then
+            case "$GITHUB_REF" in
+              refs/tags/*) mode=tag ;;
+              *) mode=off ;;
+            esac
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            mode=off
+          fi
+          echo "RELEASE_MODE=$mode" >> "$GITHUB_ENV"
+          echo "defconfig=${DEFCONFIG} | target=${KERNEL_TARGET:-<default>} | release=${mode}"
+
+      - name: Install host dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates ccache curl device-tree-compiler \
+            file flex git libelf-dev libssl-dev make openssl perl python3 \
+            python-is-python3 rsync unzip zip
+
+      - name: Show build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "kernel    : $(make kernelversion)"
+          echo "host      : $(gcc --version | head -1)"
+          echo "make      : $(make --version | head -1 | awk '{print $NF}')"
+          echo "cores/ram : $(nproc --all) cores / $(free -h | awk '/^Mem:/{print $2}') ram"
+          df -h /home/runner | awk 'NR==2{print "disk free : "$4" on "$6}'
+
+      - name: Compile kernel (clang + GCC 4.9 binutils)
+        id: compile
+        shell: bash
+        timeout-minutes: 150
+        run: |
+          set -euo pipefail
+          bash build.sh compile 2>&1 | tee build.log
+          ./clang/bin/clang --version | head -1 || true
+
+      - name: Package AnyKernel3 flashable zip
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash build.sh zupload 2>&1 | tee -a build.log
+
+      - name: Verify the build output
+        shell: bash
+        run: |
+          set -euo pipefail
+          img="$OUT_DIR/arch/$ARCH/boot/Image.gz"
+          zip="Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}.zip"
+
+          for f in "$img" "$zip"; do
+            if [[ ! -s "$f" ]]; then
+              echo "::error::$f is missing or empty"
+              ls -la .
+              exit 1
+            fi
+          done
+
+          # Image.gz has to be a real gzip stream of a sane size
+          gzip -t "$img"
+          echo "gzip -l    : $(gzip -l "$img" | tail -1)"
+          size=$(stat -c %s "$img")
+          if (( size < 10 * 1024 * 1024 || size > 128 * 1024 * 1024 )); then
+            echo "::error::Image.gz size looks wrong ($size bytes)"
+            exit 1
+          fi
+
+          # the flashable zip must carry the flasher plus the new kernel
+          listing=$(unzip -Z1 "$zip")
+          for need in anykernel.sh Image.gz META-INF/com/google/android/update-binary \
+                      tools/ak3-core.sh tools/busybox; do
+            if ! grep -qxF "$need" <<< "$listing"; then
+              echo "::error::$zip is missing $need"
+              exit 1
+            fi
+          done
+
+          # KernelSU is a headline feature of this kernel - assert it is on
+          if ! grep -q "^CONFIG_KSU=y$" "$OUT_DIR/.config"; then
+            echo "::warning::CONFIG_KSU is not enabled in $OUT_DIR/.config"
+          fi
+
+          sha256sum "$img" "$zip" | tee SHA256SUMS
+          echo "built     : $(cat "$OUT_DIR/include/config/kernel.release")"
+          echo "Image.gz  : $(du -h "$img" | cut -f1) | zip: $(du -h "$zip" | cut -f1)"
+
+      - name: Collect build metadata
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p meta
+          cp "$OUT_DIR/.config" meta/defconfig.used 2>/dev/null || true
+          cp "$OUT_DIR/include/config/kernel.release" meta/kernel.release 2>/dev/null || true
+          cp "$OUT_DIR/System.map" meta/System.map 2>/dev/null || true
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "ref=$GITHUB_REF_NAME"
+            echo "host=$(grep -m1 PRETTY_NAME /etc/os-release | cut -d'"' -f2)"
+            echo "clang=$(./clang/bin/clang --version 2>/dev/null | head -1)"
+            echo "as=$(./gcc64/bin/aarch64-linux-android-as --version 2>/dev/null | head -1)"
+            echo "defconfig=$DEFCONFIG"
+          } > meta/build-info.txt
+          cat meta/build-info.txt
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: Shadow-Kernel-${{ env.DEVICE_NAME }}-${{ env.TANGGAL }}
+          path: |
+            Shadow-Kernel-${{ env.DEVICE_NAME }}-${{ env.TANGGAL }}.zip
+            SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload build metadata
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-meta-${{ env.TANGGAL }}
+          path: |
+            meta
+            build.log
+          if-no-files-found: warn
+          compression-level: 9
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: env.RELEASE_MODE != 'off'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          zip="Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}.zip"
+          tag="$GITHUB_REF_NAME"
+          extra=""
+          if [[ "$RELEASE_MODE" == "nightly" ]]; then
+            tag="nightly"
+            extra="--prerelease"
+            # rolling tag: drop the old release so it follows this commit
+            gh release delete "$tag" --cleanup-tag --yes 2>/dev/null || true
+          fi
+
+          krel="$(cat meta/kernel.release 2>/dev/null || echo unknown)"
+          {
+            echo "Shadow Kernel for \`${DEVICE_NAME}\`, built by Actions from \`${GITHUB_SHA:0:10}\`."
+            echo
+            echo "* Kernel: \`$krel\` (Clang, KernelSU enabled)"
+            echo "* Flash from a custom recovery / sideload, then reboot."
+            echo "* AnyKernel3 reuses the stock device DTB, so this is safe to flash over a matching ROM."
+            echo
+            echo "## Checksums"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+            echo
+            echo "[Build log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          } > release-notes.md
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$zip" SHA256SUMS --clobber
+          else
+            gh release create "$tag" "$zip" SHA256SUMS \
+              --target "$GITHUB_SHA" \
+              --title "Shadow Kernel $tag" \
+              --notes-file release-notes.md \
+              $extra
+          fi
+          echo "Published: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          img="$OUT_DIR/arch/$ARCH/boot/Image.gz"
+          zip="Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}.zip"
+          krel="$(cat meta/kernel.release 2>/dev/null || echo unknown)"
+          clangv="$(./clang/bin/clang --version 2>/dev/null | head -1 || echo unknown)"
+          {
+            echo "## Shadow Kernel · ${DEVICE_NAME}"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| kernel | \`$krel\` |"
+            echo "| defconfig | \`$DEFCONFIG\` |"
+            echo "| clang | \`$clangv\` |"
+            echo "| commit | \`${GITHUB_SHA:0:10}\` |"
+            echo "| release mode | \`$RELEASE_MODE\` |"
+            if [[ -s "$zip" ]]; then
+              echo "| flashable zip | \`$zip\` ($(du -h "$zip" | cut -f1)) |"
+              echo "| Image.gz | $(du -h "$img" | cut -f1) |"
+              echo "| zip sha256 | \`$(sha256sum "$zip" | cut -c1-16)...\` |"
+            else
+              echo "| result | build did not produce a zip - see the log tail below |"
+            fi
+            if [[ "$GITHUB_REF" == refs/tags/* || "$RELEASE_MODE" == "nightly" ]]; then
+              echo "| downloads | [releases](${{ github.server_url }}/${{ github.repository }}/releases) |"
+            fi
+            if [[ "${{ job.status }}" != "success" && -f build.log ]]; then
+              echo
+              echo "### First errors"
+              echo
+              echo '```text'
+              grep -nE "error:|Error [0-9]+|No rule to make target|Failed To Compile" build.log | head -30 || true
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
