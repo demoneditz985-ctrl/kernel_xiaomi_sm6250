@@ -4,11 +4,11 @@
 ## AnyKernel setup
 # begin properties
 properties() { '
-kernel.string=x
-kernel.compiler=x
-kernel.made=x
-kernel.version=x
-message.word=x
+kernel.string=Shadow Kernel | EvolutionX | Android 16 | miatoll (POCO M2 Pro)
+kernel.compiler=Clang
+kernel.made=Vortex FR
+kernel.version=Shadow Kernel - Android 16 (EvolutionX)
+message.word=Shadow Kernel by Vortex FR - built for gaming, daily use & battery backup
 do.devicecheck=1
 do.modules=0
 do.systemless=1

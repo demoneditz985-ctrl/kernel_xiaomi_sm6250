@@ -2,8 +2,8 @@
 VERSION = 4
 PATCHLEVEL = 14
 SUBLEVEL = 357
-EXTRAVERSION = -openela
-NAME = Petit Gorille
+EXTRAVERSION = -VortexFR
+NAME = Shadow Kernel
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"

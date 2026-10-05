@@ -1,18 +1,114 @@
-Linux kernel
-============
+# Shadow Kernel
 
-This file was moved to Documentation/admin-guide/README.rst
+A custom Linux kernel for Xiaomi **miatoll** devices, built for
+**gaming, daily use and battery backup**.
 
-Please notice that there are several guides for kernel developers and users.
-These guides can be rendered in a number of formats, like HTML and PDF.
+| | |
+|---|---|
+| **Name** | Shadow Kernel |
+| **Owner / Maintainer** | Vortex FR |
+| **Platform** | Xiaomi SM6250 / SM7125 — `miatoll` |
+| **Supported devices** | POCO M2 Pro (`gram`), Redmi Note 9 Pro / Pro Max (`curtana`), Redmi Note 9S / Pro (Global) (`excalibur`), Redmi Note 9 Pro (China) (`joyeuse`) |
+| **Tested ROM target** | EvolutionX (Android 16) |
+| **Kernel base** | Linux 4.14.x (CAF / OpenELA) |
+| **Root** | **KernelSU** built-in (no separate root needed) |
 
-In order to build the documentation, use ``make htmldocs`` or
-``make pdfdocs``.
+> `miatoll` is the Xiaomi codename that covers the whole Redmi Note 9 / POCO M2 Pro
+> family. The kernel is tuned and packaged for the POCO M2 Pro, but the same image
+> flashes on every `miatoll` variant (device check is enforced by the AnyKernel3 zip).
 
-There are various text files in the Documentation/ subdirectory,
-several of them using the Restructured Text markup notation.
-See Documentation/00-INDEX for a list of what is contained in each file.
+---
 
-Please read the Documentation/process/changes.rst file, as it contains the
-requirements for building and running the kernel, and information about
-the problems which may result by upgrading your kernel.
+## Features
+
+- **KernelSU** (v0.9.5) integrated directly into the tree and built **into** the
+  kernel (`CONFIG_KSU=y`) — root with a proper, kernel-level supervisor.
+- **EAS + schedutil** as the default CPU frequency governor, with the
+  **interactive** and **performance** governors also available for gaming profiles.
+- **BFQ** block I/O scheduler and **mq-deadline** as the default I/O scheduler.
+- **TCP BBR** congestion control available (selected by the ShadowTweaks module).
+- **zRAM** with deduplication enabled for smooth multitasking.
+- Scheduler / networking / memory tunables shipped via the `ShadowTweaks` companion
+  module (gaming, daily, battery presets).
+- Built with **Clang** + LLD for a modern, optimised image.
+
+## KernelSU Manager compatibility
+
+Because KernelSU is built **in-tree** (v0.9.5), install the matching
+**KernelSU Manager v0.9.5** (or the official `me.weishu.kernelsu` manager from
+the KernelSU releases page). Newer managers expect a different kernel ABI and may
+refuse to pair with v0.9.5.
+
+After flashing Shadow Kernel, open KernelSU Manager → it should report the kernel
+as rooted. Install root apps / modules from there.
+
+## Building
+
+Toolchains are cloned automatically by `build.sh` (Clang + AArch64/ARM GCC 4.9).
+You only need `git`, `curl`, `bc`, `flex`, `bison` and **OpenSSL dev headers**
+(`libssl-dev`) on the build host — OpenSSL is required because the kernel config
+keeps `CONFIG_MODULE_SIG` and `CONFIG_FS_VERITY_BUILTIN_SIGNATURES` enabled.
+
+```bash
+# from the kernel tree root
+chmod +x build.sh
+./build.sh
+```
+
+Output: `Shadow-Kernel-miatoll-<date>.zip` in the kernel tree root.
+
+### Manual build
+
+```bash
+export ARCH=arm64
+export KBUILD_BUILD_USER=VortexFR
+export KBUILD_BUILD_HOST=Shadow-Kernel
+
+make O=out vendor/xiaomi/miatoll_defconfig
+
+make -j$(nproc) O=out \
+  ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+  CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+  LD=ld.lld
+```
+
+The kernel image is `out/arch/arm64/boot/Image.gz`.
+
+## Flashing
+
+Shadow Kernel ships as an **AnyKernel3** zip — the kernel "loader":
+
+1. Boot into recovery (TWRP / OrangeFox) **or** use KernelSU Manager → "Install":
+2. Flash `Shadow-Kernel-miatoll-<date>.zip`.
+3. Reboot. The device's existing `dtb` and ramdisk are reused
+   (AnyKernel3 only replaces the kernel), so your ROM stays intact.
+
+Optional but recommended: also flash the **ShadowTweaks** module (folder in this
+repo) through KernelSU/Magisk for the runtime gaming/daily/battery tunables.
+
+## Configuration highlights (`arch/arm64/configs/vendor/xiaomi/miatoll_defconfig`)
+
+| Option | Value | Why |
+|---|---|---|
+| `CONFIG_KSU` | `y` | KernelSU built-in root |
+| `CONFIG_KPROBES` | `y` | required by KernelSU hooks |
+| `CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL` | `y` | EAS balance of perf/battery |
+| `CONFIG_CPU_FREQ_GOV_INTERACTIVE` | `y` | gaming profile |
+| `CONFIG_IOSCHED_BFQ` | `y` | fair I/O |
+| `CONFIG_DEFAULT_IOSCHED` | `mq-deadline` | Android-friendly default |
+| `CONFIG_TCP_CONG_BBR` | `y` | modern networking |
+| `CONFIG_ZRAM` / `CONFIG_ZRAM_DEDUP` | `y` | smooth memory |
+
+## Source layout
+
+- `drivers/kernelsu/` — KernelSU v0.9.5 (integrated, in-tree).
+- `arch/arm64/configs/vendor/xiaomi/miatoll_defconfig` — Shadow Kernel config.
+- `AnyKernel3/` — flashable kernel zip (the "loader").
+- `build.sh` — automated Clang build + packaging (Vortex FR branding).
+- `ShadowTweaks/` — optional runtime-tweaks module.
+
+---
+
+*Shadow Kernel is provided as-is, for development and educational use. Flashing
+kernels carries risk — a backup and knowledge of how to restore your device are
+assumed. Maintained by Vortex FR.*

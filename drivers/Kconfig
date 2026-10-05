@@ -3,6 +3,9 @@ menu "Device Drivers"
 
 source "drivers/amba/Kconfig"
 
+# KernelSU - Kernel-based Root for Android (Shadow Kernel / Vortex FR)
+source "drivers/kernelsu/Kconfig"
+
 source "drivers/base/Kconfig"
 
 source "drivers/bus/Kconfig"
