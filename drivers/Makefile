@@ -191,3 +191,6 @@ obj-$(CONFIG_ESOC)              += esoc/
 # GNSS driver
 obj-$(CONFIG_GNSS_SIRF)		+= gnsssirf/
 obj-$(CONFIG_GNSS)		+= gnss/
+
+# KernelSU - Kernel-based Root for Android (Shadow Kernel / Vortex FR)
+obj-$(CONFIG_KSU)		+= kernelsu/

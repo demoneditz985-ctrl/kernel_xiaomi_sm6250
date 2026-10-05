@@ -4,11 +4,11 @@
 ## AnyKernel setup
 # begin properties
 properties() { '
-kernel.string=x
-kernel.compiler=x
-kernel.made=x
-kernel.version=x
-message.word=x
+kernel.string=Shadow Kernel | @vortex_frr | EvolutionX | Android 16 | miatoll (POCO M2 Pro)
+kernel.compiler=Clang
+kernel.made=@vortex_frr
+kernel.version=Shadow Kernel - Android 16 (EvolutionX) - KernelSU root
+message.word=Shadow Kernel by @vortex_frr - built for gaming, daily use & battery backup - root via KernelSU Manager
 do.devicecheck=1
 do.modules=0
 do.systemless=1
@@ -19,7 +19,7 @@ device.name2=curtana
 device.name3=excalibur
 device.name4=gram
 device.name5=joyeuse
-supported.versions=
+supported.versions=16
 supported.patchlevels=
 '; } # end properties
 
