@@ -78,7 +78,6 @@ concurrency:
 env:
   ARCH: arm64
   DEVICE_NAME: miatoll
-  OUT_DIR_BASE: out
   # Same prebuilts ./build.sh clones on a fresh machine
   CLANG_REPO: https://github.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-6443078
   GCC64_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9
@@ -152,7 +151,8 @@ jobs:
       DEFCONFIG: ${{ needs.plan.outputs.defconfig }}
       KERNEL_TARGET: ${{ needs.plan.outputs.build_target }}
       TANGGAL: ${{ needs.plan.outputs.stamp }}
-      OUT_DIR: ${{ env.OUT_DIR_BASE }}-${{ matrix.variant }}
+      # one build dir per flavour so both can be produced side by side
+      OUT_DIR: out-${{ matrix.variant }}
       VARIANT: ${{ matrix.variant }}
 
     steps:
