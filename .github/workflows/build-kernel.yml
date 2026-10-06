@@ -1,17 +1,20 @@
 # yaml-language-server: $schema=https://json.schemastore.org/github-workflow-schema.json
 #
-# Shadow Kernel CI - builds the miatoll (SM6150/SM6250 family) Image.gz and
-# packs it into a flashable AnyKernel3 zip.
+# Shadow Kernel CI - builds the miatoll (SM6150) kernel in TWO flavours and
+# ships both as flashable AnyKernel3 zips:
 #
-# The build recipe is NOT duplicated here: this workflow installs the host
-# dependencies and then runs ./build.sh, so CI and your local CLI build can
-# never drift apart.
+#   ksu       KernelSU compiled in   -> for people who want root
+#   rootless  KernelSU compiled out  -> for people who don't want root at all
+#
+# The build recipe is NOT duplicated here: each job installs the host
+# dependencies and runs ./build.sh, so CI and your local CLI build can never
+# drift apart (KSU=on/off is the only difference).
 #
 # Triggers
-#   * push to any branch                 -> build + artifacts, no release
-#   * push a tag (v*, *-release, Shadow-*) -> build + GitHub Release on that tag
-#   * pull request                       -> build only (proves it still compiles)
-#   * "Run workflow" button              -> all of the above, with options
+#   * push to any branch                   -> both variants + artifacts, no release
+#   * push a tag (v*, *-release, Shadow-*) -> both variants + a GitHub Release
+#   * pull request                         -> both variants compile-checked
+#   * "Run workflow" button                -> all of the above, with options
 #
 # Get a build: open the run -> Artifacts, or the Release if one was published.
 
@@ -32,8 +35,17 @@ on:
         type: string
         required: false
         default: ""
+      variants:
+        description: "Which flavours to build"
+        type: choice
+        required: false
+        default: both
+        options:
+          - both
+          - ksu
+          - rootless
       release_mode:
-        description: "Publish the flashable zip as a GitHub Release"
+        description: "Publish the flashable zips as a GitHub Release"
         type: choice
         required: false
         default: auto
@@ -66,43 +78,52 @@ concurrency:
 env:
   ARCH: arm64
   DEVICE_NAME: miatoll
-  DEFCONFIG: vendor/xiaomi/miatoll_defconfig
-  OUT_DIR: out
+  OUT_DIR_BASE: out
   # Same prebuilts ./build.sh clones on a fresh machine
   CLANG_REPO: https://github.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-6443078
   GCC64_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9
   GCC32_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9
 
 jobs:
-  build:
-    name: Compile + AnyKernel3 zip
-    # ubuntu-22.04 ships gcc-11, the most forgiving host compiler for a 4.14
-    # tree. Bump to ubuntu-24.04 if this label is ever retired.
+  plan:
+    name: Resolve build inputs
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
-
+    timeout-minutes: 5
+    outputs:
+      stamp: ${{ steps.stamp.outputs.stamp }}
+      defconfig: ${{ steps.decide.outputs.defconfig }}
+      build_target: ${{ steps.decide.outputs.build_target }}
+      release_mode: ${{ steps.decide.outputs.release_mode }}
+      matrix: ${{ steps.decide.outputs.matrix }}
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
+      - name: Pick a shared build stamp
+        id: stamp
+        shell: bash
+        run: echo "stamp=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve build inputs
+      - name: Decide what to build
+        id: decide
         shell: bash
         env:
           IN_DEFCONFIG: ${{ inputs.defconfig }}
           IN_TARGET: ${{ inputs.build_target }}
+          IN_VARIANTS: ${{ inputs.variants }}
           IN_RELEASE: ${{ inputs.release_mode }}
+          STAMP: ${{ steps.stamp.outputs.stamp }}
         run: |
           set -euo pipefail
-          if [[ -n "${IN_DEFCONFIG:-}" ]]; then
-            echo "DEFCONFIG=$IN_DEFCONFIG" >> "$GITHUB_ENV"
-          fi
-          if [[ -n "${IN_TARGET:-}" ]]; then
-            echo "KERNEL_TARGET=$IN_TARGET" >> "$GITHUB_ENV"
-          fi
-          # one timestamp shared by the compile step, the zip name and artifacts
-          echo "TANGGAL=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
+          echo "defconfig=${IN_DEFCONFIG:-vendor/xiaomi/miatoll_defconfig}" >> "$GITHUB_OUTPUT"
+          echo "build_target=${IN_TARGET:-}" >> "$GITHUB_OUTPUT"
+
+          # which flavours to build, as a GitHub Actions matrix
+          ksu_job='{"variant":"ksu","ksu":"on","expect_ksu":"enabled","blurb":"KernelSU built in - root via the KernelSU Manager app"}'
+          root_job='{"variant":"rootless","ksu":"off","expect_ksu":"disabled","blurb":"KernelSU compiled out - no root, nothing to manage"}'
+          case "${IN_VARIANTS:-both}" in
+            ksu)      matrix="[$ksu_job]" ;;
+            rootless) matrix="[$root_job]" ;;
+            *)        matrix="[$ksu_job,$root_job]" ;;
+          esac
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
           mode="${IN_RELEASE:-auto}"
           if [[ "$mode" == "auto" ]]; then
@@ -114,8 +135,31 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             mode=off
           fi
-          echo "RELEASE_MODE=$mode" >> "$GITHUB_ENV"
-          echo "defconfig=${DEFCONFIG} | target=${KERNEL_TARGET:-<default>} | release=${mode}"
+          echo "release_mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "stamp=$STAMP | variants=${IN_VARIANTS:-both} | release=$mode"
+
+  build:
+    name: ${{ matrix.variant }}
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      KSU: ${{ matrix.ksu }}
+      DEFCONFIG: ${{ needs.plan.outputs.defconfig }}
+      KERNEL_TARGET: ${{ needs.plan.outputs.build_target }}
+      TANGGAL: ${{ needs.plan.outputs.stamp }}
+      OUT_DIR: ${{ env.OUT_DIR_BASE }}-${{ matrix.variant }}
+      VARIANT: ${{ matrix.variant }}
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
 
       - name: Install host dependencies
         shell: bash
@@ -131,6 +175,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "variant   : $VARIANT (KSU=$KSU)"
           echo "kernel    : $(make kernelversion)"
           echo "host      : $(gcc --version | head -1)"
           echo "make      : $(make --version | head -1 | awk '{print $NF}')"
@@ -158,7 +203,7 @@ jobs:
         run: |
           set -euo pipefail
           img="$OUT_DIR/arch/$ARCH/boot/Image.gz"
-          zip="Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}.zip"
+          zip="Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}-${VARIANT}.zip"
 
           for f in "$img" "$zip"; do
             if [[ ! -s "$f" ]]; then
@@ -170,16 +215,17 @@ jobs:
 
           # Image.gz has to be a real gzip stream of a sane size
           gzip -t "$img"
-          echo "gzip -l    : $(gzip -l "$img" | tail -1)"
+          echo "gzip -l   : $(gzip -l "$img" | tail -1)"
           size=$(stat -c %s "$img")
           if (( size < 10 * 1024 * 1024 || size > 128 * 1024 * 1024 )); then
             echo "::error::Image.gz size looks wrong ($size bytes)"
             exit 1
           fi
 
-          # the flashable zip must carry the flasher plus the new kernel
+          # the flashable zip must carry the flasher, the art and the new kernel
           listing=$(unzip -Z1 "$zip")
-          for need in anykernel.sh Image.gz META-INF/com/google/android/update-binary \
+          for need in anykernel.sh banner version Image.gz \
+                      META-INF/com/google/android/update-binary \
                       tools/ak3-core.sh tools/busybox; do
             if ! grep -qxF "$need" <<< "$listing"; then
               echo "::error::$zip is missing $need"
@@ -187,14 +233,35 @@ jobs:
             fi
           done
 
-          # KernelSU is a headline feature of this kernel - assert it is on
-          if ! grep -q "^CONFIG_KSU=y$" "$OUT_DIR/.config"; then
-            echo "::warning::CONFIG_KSU is not enabled in $OUT_DIR/.config"
+          # the whole point of the matrix: the variant switch must have landed
+          if grep -q "^CONFIG_KSU=y$" "$OUT_DIR/.config"; then have=enabled; else have=disabled; fi
+          if [[ "$have" != "${{ matrix.expect_ksu }}" ]]; then
+            echo "::error::asked for KernelSU=${{ matrix.expect_ksu }} but the build is $have"
+            exit 1
           fi
+          krel="$(cat "$OUT_DIR/include/config/kernel.release")"
+          case "$VARIANT" in
+            rootless) [[ "$krel" == *rootless* ]] || { echo "::error::rootless build is not tagged in $krel"; exit 1; } ;;
+            *) [[ "$krel" != *rootless* ]] || { echo "::error::ksu build carries the rootless tag"; exit 1; } ;;
+          esac
 
           sha256sum "$img" "$zip" | tee SHA256SUMS
-          echo "built     : $(cat "$OUT_DIR/include/config/kernel.release")"
-          echo "Image.gz  : $(du -h "$img" | cut -f1) | zip: $(du -h "$zip" | cut -f1)"
+          echo "kernel    : $krel"
+          echo "KernelSU  : $have"
+          echo "sizes     : Image.gz $(du -h "$img" | cut -f1) | zip $(du -h "$zip" | cut -f1)"
+
+      - name: Stage release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}-${VARIANT}.zip" dist/
+          cp "$OUT_DIR/arch/$ARCH/boot/Image.gz" "dist/Image-${VARIANT}.gz"
+          {
+            echo "Shadow Kernel ${VARIANT} - $(cat "$OUT_DIR/include/config/kernel.release")"
+            cat SHA256SUMS
+          } > "dist/SHA256SUMS-${VARIANT}.txt"
+          ls -la dist
 
       - name: Collect build metadata
         if: always()
@@ -202,10 +269,12 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p meta
-          cp "$OUT_DIR/.config" meta/defconfig.used 2>/dev/null || true
+          cp "$OUT_DIR/.config" meta/config-${VARIANT}.used 2>/dev/null || true
           cp "$OUT_DIR/include/config/kernel.release" meta/kernel.release 2>/dev/null || true
-          cp "$OUT_DIR/System.map" meta/System.map 2>/dev/null || true
+          cp "$OUT_DIR/System.map" meta/System-${VARIANT}.map 2>/dev/null || true
           {
+            echo "variant=$VARIANT"
+            echo "ksu=$KSU"
             echo "commit=$GITHUB_SHA"
             echo "ref=$GITHUB_REF_NAME"
             echo "host=$(grep -m1 PRETTY_NAME /etc/os-release | cut -d'"' -f2)"
@@ -218,10 +287,8 @@ jobs:
       - name: Upload flashable zip
         uses: actions/upload-artifact@v7
         with:
-          name: Shadow-Kernel-${{ env.DEVICE_NAME }}-${{ env.TANGGAL }}
-          path: |
-            Shadow-Kernel-${{ env.DEVICE_NAME }}-${{ env.TANGGAL }}.zip
-            SHA256SUMS
+          name: Shadow-Kernel-${{ env.DEVICE_NAME }}-${{ needs.plan.outputs.stamp }}-${{ matrix.variant }}
+          path: dist/*
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
@@ -230,7 +297,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: build-meta-${{ env.TANGGAL }}
+          name: build-meta-${{ needs.plan.outputs.stamp }}-${{ matrix.variant }}
           path: |
             meta
             build.log
@@ -238,91 +305,30 @@ jobs:
           compression-level: 9
           retention-days: 14
 
-      - name: Publish GitHub Release
-        if: env.RELEASE_MODE != 'off'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          img="$OUT_DIR/arch/$ARCH/boot/Image.gz"
-          zip="Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}.zip"
-          tag="$GITHUB_REF_NAME"
-          # filenames carry no spaces (device name + timestamp), safe to expand
-          assets="$zip $img SHA256SUMS"
-          extra=""
-          if [[ "$RELEASE_MODE" == "nightly" ]]; then
-            tag="nightly"
-            extra="--prerelease --target $GITHUB_SHA"
-            # rolling tag: drop the old release so it follows this commit
-            gh release delete "$tag" --cleanup-tag --yes 2>/dev/null || true
-          fi
-
-          krel="$(cat meta/kernel.release 2>/dev/null || echo unknown)"
-          {
-            echo "Shadow Kernel for \`${DEVICE_NAME}\`, built by Actions from \`${GITHUB_SHA:0:10}\`."
-            echo
-            echo "* Kernel: \`$krel\` (Clang, KernelSU enabled)"
-            echo "* Flash from a custom recovery / sideload, then reboot."
-            echo "* AnyKernel3 reuses the stock device DTB, so this is safe to flash over a matching ROM."
-            echo "* \`Image.gz\` is the bare kernel, for repacking boot.img yourself."
-            echo
-            echo "## Checksums"
-            echo
-            echo '```'
-            cat SHA256SUMS
-            echo '```'
-            echo
-            echo "[Build log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
-          } > release-notes.md
-
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" $assets --clobber
-          else
-            gh release create "$tag" $assets \
-              --title "Shadow Kernel $tag" \
-              --notes-file release-notes.md \
-              $extra
-          fi
-
-          # never report success on a release without the flashable zip on it
-          attached="$(gh release view "$tag" --json assets --jq '[.assets[].name] | join(" ")')"
-          echo "release assets: $attached"
-          case " $attached " in
-            *" $(basename "$zip") "*) ;;
-            *) echo "::error::$zip was not attached to the release"; exit 1 ;;
-          esac
-          echo "Published: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
-
       - name: Write job summary
         if: always()
         shell: bash
         run: |
           set -uo pipefail
           img="$OUT_DIR/arch/$ARCH/boot/Image.gz"
-          zip="Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}.zip"
+          zip="Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}-${VARIANT}.zip"
           krel="$(cat meta/kernel.release 2>/dev/null || echo unknown)"
-          clangv="$(./clang/bin/clang --version 2>/dev/null | head -1 || echo unknown)"
+          clangv="$(./clang/bin/clang --version 2>/dev/null | head -1 | grep -oE 'clang version [0-9.]+' || echo unknown)"
           {
-            echo "## Shadow Kernel · ${DEVICE_NAME}"
+            echo "## Shadow Kernel · ${VARIANT}"
             echo
             echo "| item | value |"
             echo "| --- | --- |"
+            echo "| flavour | ${{ matrix.blurb }} |"
             echo "| kernel | \`$krel\` |"
             echo "| defconfig | \`$DEFCONFIG\` |"
             echo "| clang | \`$clangv\` |"
             echo "| commit | \`${GITHUB_SHA:0:10}\` |"
-            echo "| release mode | \`$RELEASE_MODE\` |"
             if [[ -s "$zip" ]]; then
-              echo "| flashable zip | \`$zip\` ($(du -h "$zip" | cut -f1)) |"
+              echo "| flashable zip | \`$(basename "$zip")\` ($(du -h "$zip" | cut -f1)) |"
               echo "| Image.gz | $(du -h "$img" | cut -f1) |"
-              echo "| zip sha256 | \`$(sha256sum "$zip" | cut -c1-16)...\` |"
             else
-              echo "| result | build did not produce a zip - see the log tail below |"
-            fi
-            if [[ "$GITHUB_REF" == refs/tags/* || "$RELEASE_MODE" == "nightly" ]]; then
-              echo "| downloads | [releases](${{ github.server_url }}/${{ github.repository }}/releases) |"
+              echo "| result | no zip produced - see the log tail below |"
             fi
             if [[ "${{ job.status }}" != "success" && -f build.log ]]; then
               echo
@@ -333,3 +339,94 @@ jobs:
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Publish release
+    needs: [plan, build]
+    if: needs.plan.outputs.release_mode != 'off'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Download every flavour
+        uses: actions/download-artifact@v8
+        with:
+          pattern: Shadow-Kernel-${{ env.DEVICE_NAME }}-${{ needs.plan.outputs.stamp }}-*
+          path: staging
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          STAMP: ${{ needs.plan.outputs.stamp }}
+          MODE: ${{ needs.plan.outputs.release_mode }}
+        run: |
+          set -euo pipefail
+          cd staging
+          mapfile -t assets < <(find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.gz' -o -name '*.txt' \) -printf '%P\n' | sort)
+          zips=$(find . -maxdepth 1 -name 'Shadow-Kernel-*.zip' | wc -l)
+          if (( zips == 0 )); then
+            echo "::error::no flashable zips were staged"
+            exit 1
+          fi
+          echo "attaching ${#assets[@]} files ($zips flashable zips)"
+
+          tag="$GITHUB_REF_NAME"
+          extra=""
+          if [[ "$MODE" == "nightly" ]]; then
+            tag="nightly"
+            extra="--prerelease --target $GITHUB_SHA"
+            # rolling tag: drop the old release so it follows this commit
+            gh release delete "$tag" --cleanup-tag --yes 2>/dev/null || true
+          fi
+
+          {
+            echo "Shadow Kernel for Xiaomi **miatoll** (Redmi Note 9 Pro / Pro Max / 9S, POCO M2 Pro)."
+            echo
+            echo "Built by Actions from \`${GITHUB_SHA:0:10}\` - stamp \`$STAMP\`."
+            echo
+            echo "## Pick one (do not flash both)"
+            echo
+            echo "| file | who it is for |"
+            echo "| --- | --- |"
+            echo "| \`Shadow-Kernel-miatoll-$STAMP-ksu.zip\` | you **want root**: KernelSU is built in, install the KernelSU Manager app |"
+            echo "| \`Shadow-Kernel-miatoll-$STAMP-rootless.zip\` | you **do not want root**: KernelSU is compiled out entirely |"
+            echo
+            echo "Both are AnyKernel3 zips: they swap the kernel inside your existing"
+            echo "boot image and reuse your device DTB, so recovery flash / sideload only."
+            echo "Bootloader must be unlocked and verification disabled - these builds are"
+            echo "not AVB signed, so a locked device would bootloop."
+            echo
+            echo "The flasher prints an ASCII Shadow Kernel banner plus your detected"
+            echo "codename, model, ROM, Android level and lock state before it touches"
+            echo "anything, and aborts on the wrong device or Android version."
+            echo
+            echo "## Checksums"
+            echo
+            echo '```'
+            cat $(find . -maxdepth 1 -name 'SHA256SUMS-*.txt' | sort) 2>/dev/null || true
+            echo '```'
+            echo
+            echo "[Build log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          } > ../release-notes.md
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --title "Shadow Kernel $tag" \
+              --notes-file ../release-notes.md \
+              $extra
+          fi
+
+          # never report success on a release without the flashable zips on it
+          attached="$(gh release view "$tag" --json assets --jq '[.assets[].name] | join(" ")')"
+          echo "release assets: $attached"
+          for f in "${assets[@]}"; do
+            case " $attached " in
+              *" $f "*) ;;
+              *) echo "::error::$f was not attached to the release"; exit 1 ;;
+            esac
+          done
+          echo "Published: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
