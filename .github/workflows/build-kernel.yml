@@ -125,6 +125,15 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
           mode="${IN_RELEASE:-auto}"
+          # GitHub's YAML parser treats off/no/false as booleans, so an `off`
+          # choice can arrive here as the string "false". Normalise every
+          # spelling of "do not publish" - the fail-safe direction is *no
+          # release*, never an accidental one.
+          case "$mode" in
+            off|false|no|never|0) mode=off ;;
+            nightly|tag|auto) ;;
+            *) echo "[!] unknown release_mode '$mode' - treating as off" >&2; mode=off ;;
+          esac
           if [[ "$mode" == "auto" ]]; then
             case "$GITHUB_REF" in
               refs/tags/*) mode=tag ;;
