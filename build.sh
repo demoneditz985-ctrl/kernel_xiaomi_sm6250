@@ -25,8 +25,28 @@
 # recipe in CI instead of duplicating it:
 #
 #   ARCH DEFCONFIG OUT_DIR KERNEL_TARGET DEVICE_NAME TANGGAL OUT_ZIP AK_DIR KSU
+#   MODSIG ROM_LOCALVERSION DEBUG
 #   CLANG_REPO GCC64_REPO GCC32_REPO CLANG_DIR GCC64_DIR GCC32_DIR
 #   CROSS_COMPILE CROSS_COMPILE_ARM32 SKIP_TOOLCHAIN_CLONE
+#
+# Replacing a ROM's boot image with a rebuilt kernel also has to keep that
+# ROM's /vendor/lib/modules loadable, or the phone hangs on a black screen
+# even though the kernel itself is fine. Two knobs control that:
+#   MODSIG=permissive (default)  turn CONFIG_MODULE_SIG_FORCE off. Every
+#                     kernel build generates its own certs/signing_key.pem, so
+#                     a rebuild can never hold the key your ROM signed its
+#                     .ko files with; with SIG_FORCE=y the kernel then refuses
+#                     every one of them. 'keep' leaves the defconfig policy
+#                     alone (only sensible when the ROM was built from THIS
+#                     tree with the same key still in out/).
+#   ROM_LOCALVERSION="<str>"    use exactly this as LOCALVERSION, i.e. the
+#                     `uname -r` your running ROM reports, so the modules'
+#                     vermagic still matches. Overrides the
+#                     -ShadowKernel[-rootless] tag -> the two flavours then
+#                     look identical in uname -r.
+#   DEBUG=on                     KSU_DEBUG=y (root builds only) + earlycon and
+#                     loglevel=8 on the kernel cmdline, so a hang before the
+#                     real console registers still produces output.
 #
 
 set -o pipefail
@@ -40,6 +60,9 @@ DEVICE_NAME="${DEVICE_NAME:-miatoll}"
 TANGGAL="${TANGGAL:-$(date +"%Y%m%d-%H%M")}"
 AK_DIR="${AK_DIR:-AnyKernel3}"                      # empty -> skip packaging
 KSU="${KSU:-on}"                                    # on -> KernelSU | off -> rootless
+MODSIG="${MODSIG:-permissive}"                      # permissive | keep  (module signatures)
+ROM_LOCALVERSION="${ROM_LOCALVERSION:-}"            # exact uname -r to match ROM module vermagic
+DEBUG="${DEBUG:-off}"                               # on -> KSU_DEBUG + earlycon
 
 # toolchains: "<git repo>" cloned into "<dir>", detected via "<marker>"
 CLANG_REPO="${CLANG_REPO:-https://github.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-6443078}"
@@ -64,6 +87,24 @@ case "$KSU" in
         LOCAL_VERSION="-ShadowKernel-rootless" ;;
     *)
         echo "[!] KSU must be 'on' or 'off' (got: $KSU)" >&2
+        exit 1 ;;
+esac
+
+# ---- module-compat + debug policy ------------------------------------------
+# Both of these are asserted again against the *final* .config in compile(),
+# because a silently-ignored toggle is exactly how a black-screen build ships.
+case "$MODSIG" in
+    permissive|"") MODSIG_WANT=0 ;;   # 0 -> do NOT force module signatures
+    keep)          MODSIG_WANT=1 ;;
+    *)
+        echo "[!] MODSIG must be 'permissive' or 'keep' (got: $MODSIG)" >&2
+        exit 1 ;;
+esac
+case "$DEBUG" in
+    on|y|yes|1) DEBUG_WANT=1 ;;
+    off|n|no|0|"") DEBUG_WANT=0 ;;
+    *)
+        echo "[!] DEBUG must be 'on' or 'off' (got: $DEBUG)" >&2
         exit 1 ;;
 esac
 OUT_ZIP="${OUT_ZIP:-Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}-${VARIANT}.zip}"
@@ -138,16 +179,79 @@ function compile()
     fi
     make O="$OUT_DIR" ARCH="$ARCH" "$DEFCONFIG" || return 1
 
+    # --- vermagic: whatever uname -r ends up being is also the string every
+    #     prebuilt .ko has to agree with, so a ROM-localised build must be able
+    #     to pin it instead of arguing with the vendor modules ---
+    if [ -n "$ROM_LOCALVERSION" ]; then
+        echo "[*] LOCALVERSION forced to '$ROM_LOCALVERSION' (matching the ROM's modules)"
+        echo "[!] in this mode uname -r no longer tells the two flavours apart" >&2
+        LOCAL_VERSION="$ROM_LOCALVERSION"
+    fi
+
     # --- Variant switch: drop KernelSU and mark the build so uname -r tells
-    #     the two flavours apart once booted ---
+    #     the two flavours apart once booted. (drivers/kernelsu/Kconfig defines
+    #     only KSU and KSU_DEBUG; the KSU_DISABLE_* lines some defconfigs carry
+    #     are leftovers that olddefconfig discards, so they are not touched.) ---
     ./scripts/config --file "$OUT_DIR/.config" \
         --set-str LOCALVERSION "$LOCAL_VERSION" || return 1
     if [ "$KSU_WANT" = "0" ]; then
         ./scripts/config --file "$OUT_DIR/.config" \
-            --disable KSU --disable KSU_DEBUG \
-            --disable KSU_DISABLE_MANAGER --disable KSU_DISABLE_POLICY || return 1
+            --disable KSU --disable KSU_DEBUG || return 1
     fi
+
+    # --- module signatures. certs/signing_key.pem is generated per build and
+    #     is not in the tree, so this kernel's key can never be the key your
+    #     ROM signed /vendor/lib/modules with. With MODULE_SIG_FORCE=y those
+    #     modules are refused -> display/audio never come up -> bootloop.
+    #     MODULE_SIG stays on, so signature checks still happen when a module
+    #     does carry one; only the hard requirement goes away. ---
+    if [ "$MODSIG_WANT" = "0" ]; then
+        ./scripts/config --file "$OUT_DIR/.config" \
+            --disable MODULE_SIG_FORCE || return 1
+    else
+        echo "[*] MODSIG=keep -> leaving CONFIG_MODULE_SIG_FORCE as the defconfig sets it"
+    fi
+
+    # --- debug build: KSU's own pr_info stream + early output on the console.
+    #     arm64 4.14 has no EARLY_PRINTK symbol, so earlycon goes on the
+    #     cmdline (CONFIG_CMDLINE_EXTEND=y here, so the bootloader's own
+    #     androidboot args still win and this is purely additive) ---
+    if [ "$DEBUG_WANT" = "1" ]; then
+        if [ "$KSU_WANT" = "1" ]; then
+            ./scripts/config --file "$OUT_DIR/.config" --enable KSU_DEBUG || return 1
+        else
+            echo "[*] DEBUG=on with KSU=off -> KSU_DEBUG skipped, nothing to debug"
+        fi
+        local base_cmdline
+        # strip BOTH quotes - `cut -d'"' -f2-` would keep the trailing one and
+        # --set-str would then wrap the whole thing again
+        base_cmdline="$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "$OUT_DIR/.config" | tail -n1)"
+        case "$base_cmdline" in
+            *earlycon*) echo "[*] earlycon already on the cmdline" ;;
+            *)  ./scripts/config --file "$OUT_DIR/.config" \
+                    --set-str CMDLINE "${base_cmdline:+$base_cmdline }earlycon loglevel=8" \
+                    || return 1 ;;
+        esac
+    fi
+
     make O="$OUT_DIR" ARCH="$ARCH" olddefconfig >/dev/null || return 1
+
+    # the toggles above have to survive olddefconfig, or they did nothing
+    if [ "$MODSIG_WANT" = "0" ] && grep -q '^CONFIG_MODULE_SIG_FORCE=y' "$OUT_DIR/.config"; then
+        echo "[!] MODSIG=permissive but CONFIG_MODULE_SIG_FORCE=y survived olddefconfig" >&2
+        echo "    -> your ROM's modules would be refused; refusing to ship that build" >&2
+        return 1
+    fi
+    if [ "$DEBUG_WANT" = "1" ] && [ "$KSU_WANT" = "1" ] \
+       && ! grep -q '^CONFIG_KSU_DEBUG=y' "$OUT_DIR/.config"; then
+        echo "[!] DEBUG=on but CONFIG_KSU_DEBUG is not enabled" >&2
+        return 1
+    fi
+    if grep -q '^CONFIG_MODULE_SIG_FORCE=y' "$OUT_DIR/.config"; then
+        echo "[*] module signatures: FORCED (only right if the ROM shares this key)"
+    else
+        echo "[*] module signatures: not forced -> the ROM's prebuilt .ko files load"
+    fi
 
     if grep -q "^CONFIG_KSU=y$" "$OUT_DIR/.config"; then
         [ "$KSU_WANT" = "1" ] || { echo "[!] asked for rootless but CONFIG_KSU is still on"; return 1; }
@@ -184,7 +288,22 @@ function compile()
 # fill the per-build info the flasher prints from the zip's "version" file
 write_version_file()
 {
-    local dir="$1" krel ccver sha boards android
+    local dir="$1" krel ccver sha boards android modsig
+    # what the kernel will accept from /vendor/lib/modules - worth showing at
+    # flash time, because "modules refused" is what a black screen after a
+    # kernel swap usually turns out to be
+    if [ -f "$OUT_DIR/.config" ]; then
+        if grep -q '^CONFIG_MODULE_SIG_FORCE=y' "$OUT_DIR/.config"; then
+            modsig="enforced"
+        else
+            modsig="not enforced"
+        fi
+    else
+        case "$MODSIG_WANT" in
+            0) modsig="not enforced" ;;
+            *) modsig="whatever the defconfig says" ;;
+        esac
+    fi
     krel="$(cat "$OUT_DIR/include/config/kernel.release" 2>/dev/null || echo unknown)"
     ccver="$("$CLANG_DIR/bin/clang" --version 2>/dev/null | grep -oE 'clang version [0-9.]+' | head -1)"
     [ "$ccver" ] || ccver="$(command -v clang >/dev/null && clang --version | grep -oE 'clang version [0-9.]+' | head -1 || echo unknown)"
@@ -198,6 +317,8 @@ write_version_file()
         printf ' Compiler  : %s\n' "$ccver"
         printf ' Built     : %s UTC\n' "$(date -u +"%Y-%m-%d %H:%M")"
         printf ' Commit    : %s\n' "$sha"
+        printf ' Modules   : signatures %s\n' "$modsig"
+        [ "$DEBUG_WANT" = "1" ] && printf ' Debug     : earlycon + KSU_DEBUG on\n'
         [ "$boards" ]  && printf ' For       : %s\n' "${boards% }"
         [ "$android" ] && printf ' Android   : %s\n' "$android"
     } > "$dir/version"

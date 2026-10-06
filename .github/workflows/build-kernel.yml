@@ -35,6 +35,27 @@ on:
         type: string
         required: false
         default: ""
+      modulesig:
+        description: "Module signature policy - 'permissive' keeps your ROM's prebuilt .ko files loadable"
+        type: choice
+        required: false
+        default: permissive
+        options:
+          - permissive
+          - keep
+      localversion:
+        description: "Pin LOCALVERSION / uname -r to what your ROM reports (empty = -ShadowKernel[-rootless])"
+        type: string
+        required: false
+        default: ""
+      debug:
+        description: "Debug build: KSU_DEBUG + earlycon (root flavour only)"
+        type: choice
+        required: false
+        default: "off"
+        options:
+          - "off"
+          - "on"
       variants:
         description: "Which flavours to build"
         type: choice
@@ -94,6 +115,9 @@ jobs:
       build_target: ${{ steps.decide.outputs.build_target }}
       release_mode: ${{ steps.decide.outputs.release_mode }}
       matrix: ${{ steps.decide.outputs.matrix }}
+      modulesig: ${{ steps.decide.outputs.modulesig }}
+      localversion: ${{ steps.decide.outputs.localversion }}
+      debug: ${{ steps.decide.outputs.debug }}
     steps:
       - name: Pick a shared build stamp
         id: stamp
@@ -108,6 +132,9 @@ jobs:
           IN_TARGET: ${{ inputs.build_target }}
           IN_VARIANTS: ${{ inputs.variants }}
           IN_RELEASE: ${{ inputs.release_mode }}
+          IN_MODSIG: ${{ inputs.modulesig }}
+          IN_LOCALVERSION: ${{ inputs.localversion }}
+          IN_DEBUG: ${{ inputs.debug }}
           STAMP: ${{ steps.stamp.outputs.stamp }}
         run: |
           set -euo pipefail
@@ -123,6 +150,29 @@ jobs:
             *)        matrix="[$ksu_job,$root_job]" ;;
           esac
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+          # Module signature policy, optional vermagic pin and debug build.
+          # YAML reads on/off/yes/no as booleans, so normalise here rather than
+          # letting a "false" reach build.sh, which is strict on purpose.
+          case "${IN_MODSIG:-permissive}" in
+            keep) modulesig=keep ;;
+            *)    modulesig=permissive ;;
+          esac
+          case "${IN_DEBUG:-off}" in
+            on|true|yes|y|1) debug=on ;;
+            *)               debug=off ;;
+          esac
+          # A pasted `uname -r` may carry quotes/backticks/$ - none of those may
+          # survive into a shell string ("  042, ' 047, ` 140, $ 044, \ 134, ; 073
+          lv="$(printf '%s' "${IN_LOCALVERSION:-}" | tr -d '\042\047\140\044\134\073\r\n')"
+          lv="${lv#"${lv%%[![:space:]]*}"}"
+          lv="${lv%"${lv##*[![:space:]]}"}"
+          echo "modulesig=$modulesig" >> "$GITHUB_OUTPUT"
+          echo "debug=$debug" >> "$GITHUB_OUTPUT"
+          echo "localversion=$lv" >> "$GITHUB_OUTPUT"
+          if [ -n "$lv" ]; then
+            echo "note: LOCALVERSION pinned to '$lv'; uname -r will not distinguish the flavours"
+          fi
 
           mode="${IN_RELEASE:-auto}"
           # GitHub's YAML parser treats off/no/false as booleans, so an `off`
@@ -160,6 +210,10 @@ jobs:
       DEFCONFIG: ${{ needs.plan.outputs.defconfig }}
       KERNEL_TARGET: ${{ needs.plan.outputs.build_target }}
       TANGGAL: ${{ needs.plan.outputs.stamp }}
+      # module ABI compatibility knobs (see build.sh header)
+      MODSIG: ${{ needs.plan.outputs.modulesig }}
+      ROM_LOCALVERSION: ${{ needs.plan.outputs.localversion }}
+      DEBUG: ${{ needs.plan.outputs.debug }}
       # one build dir per flavour so both can be produced side by side
       OUT_DIR: out-${{ matrix.variant }}
       VARIANT: ${{ matrix.variant }}
@@ -209,6 +263,10 @@ jobs:
 
       - name: Verify the build output
         shell: bash
+        env:
+          MODSIG_IN: ${{ needs.plan.outputs.modulesig }}
+          DEBUG_IN: ${{ needs.plan.outputs.debug }}
+          LV_IN: ${{ needs.plan.outputs.localversion }}
         run: |
           set -euo pipefail
           img="$OUT_DIR/arch/$ARCH/boot/Image.gz"
@@ -248,15 +306,47 @@ jobs:
             echo "::error::asked for KernelSU=${{ matrix.expect_ksu }} but the build is $have"
             exit 1
           fi
+          # module compatibility: a rebuilt kernel that black-screens usually
+          # died on refused modules, so assert the policy survived olddefconfig
+          if grep -q '^CONFIG_MODULE_SIG_FORCE=y' "$OUT_DIR/.config"; then
+            sigs=enforced
+          else
+            sigs=permissive
+          fi
+          if [[ "$MODSIG_IN" == "permissive" && "$sigs" == enforced ]]; then
+            echo "::error::modulesig=permissive but the shipped config still forces module signatures"
+            echo "   -> your ROM's /vendor/lib/modules would be refused and the phone would hang"
+            exit 1
+          fi
+          if [[ "$DEBUG_IN" == "on" && "${{ matrix.expect_ksu }}" == "enabled" ]]; then
+            grep -q '^CONFIG_KSU_DEBUG=y' "$OUT_DIR/.config" \
+              || { echo "::error::debug=on but CONFIG_KSU_DEBUG is off"; exit 1; }
+            grep -q '^CONFIG_CMDLINE=.*earlycon' "$OUT_DIR/.config" \
+              || { echo "::error::debug=on but earlycon is not on the kernel cmdline"; exit 1; }
+          fi
+
           krel="$(cat "$OUT_DIR/include/config/kernel.release")"
-          case "$VARIANT" in
-            rootless) [[ "$krel" == *rootless* ]] || { echo "::error::rootless build is not tagged in $krel"; exit 1; } ;;
-            *) [[ "$krel" != *rootless* ]] || { echo "::error::ksu build carries the rootless tag"; exit 1; } ;;
-          esac
+          if [[ -n "$LV_IN" ]]; then
+            # pinned to match the ROM's module vermagic, so the flavour tag is
+            # gone on purpose - check the pin instead of the tag
+            if [[ "$krel" != "$LV_IN" ]]; then
+              echo "::error::asked for uname -r '$LV_IN' but the build reports '$krel'"
+              exit 1
+            fi
+          else
+            case "$VARIANT" in
+              rootless) [[ "$krel" == *rootless* ]] || { echo "::error::rootless build is not tagged in $krel"; exit 1; } ;;
+              *) [[ "$krel" != *rootless* ]] || { echo "::error::ksu build carries the rootless tag"; exit 1; } ;;
+            esac
+          fi
 
           sha256sum "$img" "$zip" | tee SHA256SUMS
           echo "kernel    : $krel"
           echo "KernelSU  : $have"
+          echo "Mod sigs  : $sigs (requested: $MODSIG_IN)"
+          # plain `if`, not `[ -n ] && echo` - a false test as the last command
+          # of a set -e step is an exit 1
+          if [ -n "$LV_IN" ]; then echo "uname -r  : pinned to $LV_IN"; fi
           echo "sizes     : Image.gz $(du -h "$img" | cut -f1) | zip $(du -h "$zip" | cut -f1)"
 
       - name: Stage release files
@@ -332,6 +422,17 @@ jobs:
             echo "| kernel | \`$krel\` |"
             echo "| defconfig | \`$DEFCONFIG\` |"
             echo "| clang | \`$clangv\` |"
+            if [ -f "$OUT_DIR/.config" ]; then
+              if grep -q '^CONFIG_MODULE_SIG_FORCE=y' "$OUT_DIR/.config"; then
+                echo "| module signatures | **forced** (ROM .ko files may be refused) |"
+              else
+                echo "| module signatures | not forced - ROM .ko files load |"
+              fi
+            fi
+            echo "| debug build | ${{ needs.plan.outputs.debug }} |"
+            if [ -n "${{ needs.plan.outputs.localversion }}" ]; then
+              echo "| uname -r pinned to | \`${{ needs.plan.outputs.localversion }}\` |"
+            fi
             echo "| commit | \`${GITHUB_SHA:0:10}\` |"
             if [[ -s "$zip" ]]; then
               echo "| flashable zip | \`$(basename "$zip")\` ($(du -h "$zip" | cut -f1)) |"
@@ -410,6 +511,30 @@ jobs:
             echo "The flasher prints an ASCII Shadow Kernel banner plus your detected"
             echo "codename, model, ROM, Android level and lock state before it touches"
             echo "anything, and aborts on the wrong device or Android version."
+            echo
+            echo "## Module compatibility"
+            echo
+            echo "Every kernel build invents its own \`certs/signing_key.pem\`, so a rebuilt"
+            echo "kernel can never hold the key your ROM signed \`/vendor/lib/modules\` with."
+            echo "With \`CONFIG_MODULE_SIG_FORCE=y\` those modules get refused and the phone"
+            echo "hangs on a black screen even though the kernel is fine - so these builds"
+            echo "do not force module signatures (the CI job asserts it in the final .config)."
+            if [[ -n "${{ needs.plan.outputs.localversion }}" ]]; then
+              echo
+              echo "\`uname -r\` is pinned to \`${{ needs.plan.outputs.localversion }}\` so the"
+              echo "vermagic your ROM's modules were built against still matches."
+            fi
+            echo
+            echo "## If it does not boot"
+            echo
+            echo "The last log survives in ramoops - from a recovery terminal:"
+            echo
+            echo '```'
+            echo "cat /sys/fs/pstore/console-ramoops-0 > /sdcard/pstore.txt"
+            echo "grep -iE 'vermagic|version of symbol|signature|not trusted|Unknown symbol|panic' /sdcard/pstore.txt"
+            echo '```'
+            echo
+            echo "Undo with: \`fastboot flash boot <your boot-orig.img backup>\`."
             echo
             echo "## Checksums"
             echo
