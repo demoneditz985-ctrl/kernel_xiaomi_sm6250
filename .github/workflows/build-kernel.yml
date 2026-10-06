@@ -246,12 +246,15 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          img="$OUT_DIR/arch/$ARCH/boot/Image.gz"
           zip="Shadow-Kernel-${DEVICE_NAME}-${TANGGAL}.zip"
           tag="$GITHUB_REF_NAME"
+          # filenames carry no spaces (device name + timestamp), safe to expand
+          assets="$zip $img SHA256SUMS"
           extra=""
           if [[ "$RELEASE_MODE" == "nightly" ]]; then
             tag="nightly"
-            extra="--prerelease"
+            extra="--prerelease --target $GITHUB_SHA"
             # rolling tag: drop the old release so it follows this commit
             gh release delete "$tag" --cleanup-tag --yes 2>/dev/null || true
           fi
@@ -263,6 +266,7 @@ jobs:
             echo "* Kernel: \`$krel\` (Clang, KernelSU enabled)"
             echo "* Flash from a custom recovery / sideload, then reboot."
             echo "* AnyKernel3 reuses the stock device DTB, so this is safe to flash over a matching ROM."
+            echo "* \`Image.gz\` is the bare kernel, for repacking boot.img yourself."
             echo
             echo "## Checksums"
             echo
@@ -274,14 +278,21 @@ jobs:
           } > release-notes.md
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$zip" SHA256SUMS --clobber
+            gh release upload "$tag" $assets --clobber
           else
-            gh release create "$tag" "$zip" SHA256SUMS \
-              --target "$GITHUB_SHA" \
+            gh release create "$tag" $assets \
               --title "Shadow Kernel $tag" \
               --notes-file release-notes.md \
               $extra
           fi
+
+          # never report success on a release without the flashable zip on it
+          attached="$(gh release view "$tag" --json assets --jq '[.assets[].name] | join(" ")')"
+          echo "release assets: $attached"
+          case " $attached " in
+            *" $(basename "$zip") "*) ;;
+            *) echo "::error::$zip was not attached to the release"; exit 1 ;;
+          esac
           echo "Published: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
 
       - name: Write job summary
