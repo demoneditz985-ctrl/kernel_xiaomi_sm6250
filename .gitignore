@@ -76,6 +76,9 @@ modules.builtin
 !.gitignore
 !.mailmap
 !.cocciconfig
+# CI workflows (the generic ".*" rule above would hide them)
+!/.github/
+!/.github/**
 
 #
 # Generated include files
@@ -136,3 +139,11 @@ gcc32/
 gcc64/
 out/
 AnyKernel/
+
+# build.sh / CI byproducts
+/Shadow-Kernel-*.zip
+/SHA256SUMS
+/release-notes.md
+/build.log
+/meta/
+/dist/

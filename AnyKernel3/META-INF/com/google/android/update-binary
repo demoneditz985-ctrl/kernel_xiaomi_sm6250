@@ -294,6 +294,58 @@ int2ver() {
     echo "$1";
   fi;
 }
+do_targetinfo() {
+  local bp=$ANDROID_ROOT/build.prop p rom rel lvl codename model board soc kver;
+  local locked avb verity rootnow;
+  codename=$(getprop ro.product.device 2>/dev/null);
+  model=$(getprop ro.product.marketname 2>/dev/null);
+  [ "$model" ] || model=$(getprop ro.product.model 2>/dev/null);
+  board=$(getprop ro.product.board 2>/dev/null);
+  soc=$(getprop ro.soc.model 2>/dev/null);
+  [ "$soc" ] || soc=$(getprop ro.board.platform 2>/dev/null);
+  kver=$(uname -r 2>/dev/null);
+  rom=;
+  if [ -f $bp ]; then
+    rel=$(file_getprop $bp ro.build.version.release);
+    lvl=$(file_getprop $bp ro.build.version.security_patch);
+    for p in ro.lineage.version ro.crdroid.version ro.aospa.version \
+             ro.pixeextension.version ro.resurrection.version ro.cm.version ro.modversion; do
+      [ "$rom" ] || rom=$(file_getprop $bp $p);
+    done;
+    [ "$rom" ] || rom=$($BB grep -iE '^[^=]*(evolution|lineage|crdroid|aospa|havoc|resurrection)[^=]*=[^ ]+' $bp 2>/dev/null | $BB head -1 | $BB cut -d= -f2-);
+    [ "$rom" ] || rom=$(file_getprop $bp ro.build.flavor);
+  else
+    rel=; lvl=;
+    rom="no /system mounted - mount it in recovery";
+  fi;
+  [ "$rom" ] || rom="custom ROM (build.prop has no label)";
+  locked=$(getprop ro.boot.flash.locked 2>/dev/null);
+  avb=$(getprop ro.boot.verifiedbootstate 2>/dev/null);
+  verity=$(getprop ro.boot.veritymode 2>/dev/null);
+  rootnow="none detected";
+  [ -e /dev/ksu ] && rootnow="KernelSU active";
+  if [ -d /dev/.magisk -o -d /sbin/.magisk ]; then rootnow="Magisk active"; fi;
+  ui_print " ";
+  ui_print "-------------------------------------";
+  ui_print " Device     : ${codename:-unknown}";
+  ui_print " Model      : ${model:-unknown}";
+  ui_print " Board / SoC: ${board:-?} / ${soc:-?}";
+  ui_print " ROM        : $rom";
+  ui_print " Android    : ${rel:-?}  patch ${lvl:-?}";
+  ui_print " Now boots  : ${kver:-?}";
+  ui_print " Root now   : $rootnow";
+  ui_print " Lock / AVB : ${locked:-?} / ${avb:-n/a}";
+  ui_print " verity     : ${verity:-n/a}";
+  [ "$BUILD_DATE" ] && ui_print " zip built  : $BUILD_DATE";
+  ui_print "-------------------------------------";
+  if [ "$locked" = 1 ]; then
+    ui_print " WARNING: bootloader looks LOCKED.";
+    ui_print " This kernel is not AVB signed, so flashing it";
+    ui_print " now would very likely bootloop. Unlock and";
+    ui_print " disable verification first.";
+    ui_print "-------------------------------------";
+  fi;
+}
 do_versioncheck() {
   [ "$(file_getprop anykernel.sh supported.versions)" ] || return 1;
   local android_ver hi_ver lo_ver parsed_ver supported supported_ver;
@@ -485,6 +537,7 @@ if [ -f version ]; then
   ui_printfile version;
   ui_print " ";
 fi;
+do_targetinfo;
 ui_print "- Preparing Environment Setup ...";
 $BB grep -oE 'AK_BASE.*' META-INF/com/google/android/updater-script >&2;
 ui_print " ";
